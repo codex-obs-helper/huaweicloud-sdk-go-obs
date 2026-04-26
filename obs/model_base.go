@@ -293,10 +293,13 @@ type LifecycleFilter struct {
 
 // BucketEncryptionConfiguration defines the bucket encryption configuration
 type BucketEncryptionConfiguration struct {
-	XMLName        xml.Name `xml:"ServerSideEncryptionConfiguration"`
-	SSEAlgorithm   string   `xml:"Rule>ApplyServerSideEncryptionByDefault>SSEAlgorithm"`
-	KMSMasterKeyID string   `xml:"Rule>ApplyServerSideEncryptionByDefault>KMSMasterKeyID,omitempty"`
-	ProjectID      string   `xml:"Rule>ApplyServerSideEncryptionByDefault>ProjectID,omitempty"`
+	XMLName                 xml.Name `xml:"ServerSideEncryptionConfiguration"`
+	SSEAlgorithm            string   `xml:"Rule>ApplyServerSideEncryptionByDefault>SSEAlgorithm"`
+	KMSMasterKeyID          string   `xml:"Rule>ApplyServerSideEncryptionByDefault>KMSMasterKeyID,omitempty"`
+	KMSDataEncryption       string   `xml:"Rule>ApplyServerSideEncryptionByDefault>KMSDataEncryption,omitempty"`
+	ProjectID               string   `xml:"Rule>ApplyServerSideEncryptionByDefault>ProjectID,omitempty"`
+	BucketKeyEnabled        bool     `xml:"Rule>BucketKeyEnabled,omitempty"`
+	BucketKeyRotationPeriod int64    `xml:"Rule>BucketKeyRotationPeriod,omitempty"`
 }
 
 // Tag defines tag property in BucketTagging

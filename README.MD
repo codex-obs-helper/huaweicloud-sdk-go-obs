@@ -1,3 +1,16 @@
+Version 3.26.3
+
+New Features:
+
+1. Added new APIs for Object Tagging.
+2. Supported encryption configuration during bucket creation.
+
+Bug Fixes:
+
+1. Fixed an issue where Content-Length was set to 0 when uploading a 0KB object using chunked mode.
+
+-----------------------------------------------------------------------------------
+
 Version 3.25.9
 
 New Features:

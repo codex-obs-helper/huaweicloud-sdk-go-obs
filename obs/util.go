@@ -659,3 +659,9 @@ func validateLength(value int, minLen int, maxLen int, fieldName string) error {
 	}
 	return nil
 }
+
+func updateVersionId(objectTaggingOutput *ObjectTaggingOutput) {
+	if versionID, ok := objectTaggingOutput.ResponseHeaders[HEADER_VERSION_ID]; ok && len(versionID) > 0 {
+		objectTaggingOutput.VersionId = versionID[0]
+	}
+}

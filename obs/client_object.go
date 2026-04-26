@@ -125,6 +125,52 @@ func (obsClient ObsClient) SetObjectMetadata(input *SetObjectMetadataInput, exte
 	return
 }
 
+// GetObjectTagging gets object tags
+func (obsClient ObsClient) GetObjectTagging(input *GetObjectTaggingInput, extensions ...extensionOptions) (output *GetObjectTaggingOutput, err error) {
+	if input == nil {
+		return nil, errors.New("GetObjectTaggingInput is nil")
+	}
+	output = &GetObjectTaggingOutput{}
+	err = obsClient.doActionWithBucketAndKey("GetObjectTagging", HTTP_GET, input.Bucket, input.Key, input, output, extensions)
+	if err != nil {
+		return nil, err
+	}
+	updateVersionId(&output.ObjectTaggingOutput)
+	return output, nil
+}
+
+// SetObjectTagging sets object tags
+func (obsClient ObsClient) SetObjectTagging(input *SetObjectTaggingInput, extensions ...extensionOptions) (output *SetObjectTaggingOutput, err error) {
+	if input == nil {
+		return nil, errors.New("SetObjectTaggingInput is nil")
+	}
+
+	output = &SetObjectTaggingOutput{}
+	err = obsClient.doActionWithBucketAndKey("SetObjectTagging", HTTP_PUT, input.Bucket, input.Key, input, output, extensions)
+	if err != nil {
+		return nil, err
+	}
+
+	updateVersionId(&output.ObjectTaggingOutput)
+	return output, nil
+}
+
+// DeleteObjectTagging deletes object tags
+func (obsClient ObsClient) DeleteObjectTagging(input *DeleteObjectTaggingInput, extensions ...extensionOptions) (output *DeleteObjectTaggingOutput, err error) {
+	if input == nil {
+		return nil, errors.New("DeleteObjectTaggingInput is nil")
+	}
+
+	output = &DeleteObjectTaggingOutput{}
+	err = obsClient.doActionWithBucketAndKey("DeleteObjectTagging", HTTP_DELETE, input.Bucket, input.Key, input, output, extensions)
+	if err != nil {
+		return nil, err
+	}
+
+	updateVersionId(&output.ObjectTaggingOutput)
+	return output, nil
+}
+
 // DeleteObject deletes an object.
 //
 // You can use this API to delete an object from a specified bucket.

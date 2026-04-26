@@ -88,6 +88,8 @@ func (input CreateBucketInput) trans(isObs bool) (params map[string]string, head
 		setHeaders(headers, headerFSFileInterface, []string{"Enabled"}, true)
 	}
 
+	setSseHeader(headers, input.SseHeader, false, true, isObs)
+
 	if location := strings.TrimSpace(input.Location); location != "" {
 		input.Location = location
 
@@ -337,6 +339,7 @@ func handleDomainConfig(customDomainConfiguration CustomDomainConfiguration) (he
 	return
 }
 
+// isObs在该场景下不区分
 func (input SetBucketCustomDomainInput) trans(isObs bool) (params map[string]string, headers map[string][]string, data interface{}, err error) {
 	params = map[string]string{string(SubResourceCustomDomain): input.CustomDomain}
 	headers = make(map[string][]string)

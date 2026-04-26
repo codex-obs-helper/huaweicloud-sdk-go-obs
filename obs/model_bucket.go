@@ -14,6 +14,7 @@ package obs
 
 import (
 	"encoding/xml"
+	"time"
 )
 
 // DeleteBucketCustomDomainInput is the input parameter of DeleteBucketCustomDomain function
@@ -35,7 +36,6 @@ type CustomDomainConfiguration struct {
 	CertificateChain string `xml:"CertificateChain,omitempty"`
 	PrivateKey       string `xml:"PrivateKey"`
 }
-
 type SetBucketCustomDomainInput struct {
 	Bucket                    string
 	CustomDomain              string
@@ -99,6 +99,14 @@ type CreateBucketInput struct {
 	BucketRedundancy            BucketRedundancyType `xml:"-"`
 	IsFusionAllowUpgrade        bool                 `xml:"-"`
 	IsRedundancyAllowALT        bool                 `xml:"-"`
+	SseHeader                   ISseHeader
+}
+
+type CreateBucketOutput struct {
+	BaseModel
+	Date      time.Time `xml:"-"`
+	Location  string    `xml:"-"`
+	SseHeader ISseHeader
 }
 
 // SetBucketStoragePolicyInput is the input parameter of SetBucketStoragePolicy function

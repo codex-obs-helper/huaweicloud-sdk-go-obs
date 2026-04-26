@@ -15,6 +15,7 @@ package obs
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -209,6 +210,28 @@ func ConvertLoggingStatusToXml(input BucketLoggingStatus, returnMd5 bool, isObs 
 	if returnMd5 {
 		md5 = Base64Md5([]byte(data))
 	}
+	return
+}
+
+func ConvertObjectTagsToXml(input []Tag, returnMd5 bool) (data string, md5 string, err error) {
+	if len(input) == 0 {
+		err = fmt.Errorf("no tags provided")
+		return
+	}
+	tagging := Tagging{
+		Tags: input,
+	}
+
+	out, e := xml.Marshal(tagging)
+	if e != nil {
+		err = fmt.Errorf("failed to marshal xml: %w", e)
+		return
+	}
+
+	if returnMd5 {
+		md5 = Base64Md5(out)
+	}
+	data = string(out)
 	return
 }
 
@@ -487,12 +510,26 @@ func ConvertEncryptionConfigurationToXml(input BucketEncryptionConfiguration, re
 		kmsKeyID := XmlTranscoding(input.KMSMasterKeyID)
 		xml = append(xml, fmt.Sprintf("<KMSMasterKeyID>%s</KMSMasterKeyID>", kmsKeyID))
 	}
+	if input.KMSDataEncryption != "" {
+		kmsKeyID := XmlTranscoding(input.KMSDataEncryption)
+		xml = append(xml, fmt.Sprintf("<KMSDataEncryption>%s</KMSDataEncryption>", kmsKeyID))
+	}
 	if input.ProjectID != "" {
 		projectID := XmlTranscoding(input.ProjectID)
 		xml = append(xml, fmt.Sprintf("<ProjectID>%s</ProjectID>", projectID))
 	}
 
-	xml = append(xml, "</ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>")
+	xml = append(xml, "</ApplyServerSideEncryptionByDefault>")
+
+	if input.BucketKeyEnabled {
+		xml = append(xml, fmt.Sprintf("<BucketKeyEnabled>%v</BucketKeyEnabled>", input.BucketKeyEnabled))
+	}
+	if input.BucketKeyRotationPeriod != 0 {
+		xml = append(xml, fmt.Sprintf("<BucketKeyRotationPeriod>%d</BucketKeyRotationPeriod>", input.BucketKeyRotationPeriod))
+	}
+
+	xml = append(xml, "</Rule></ServerSideEncryptionConfiguration>")
+
 	data = strings.Join(xml, "")
 	if returnMd5 {
 		md5 = Base64Md5([]byte(data))
@@ -645,6 +682,21 @@ func parseSseHeader(responseHeaders map[string][]string) (sseHeader ISseHeader) 
 			sseKmsHeader.Key = ret[0]
 		} else if ret, ok = responseHeaders[HEADER_SSEKMS_ENCRYPT_KEY_OBS]; ok {
 			sseKmsHeader.Key = ret[0]
+		}
+		if ret, ok = responseHeaders[HEADER_SSEKMS_DATA_ENCRYPTION]; ok {
+			sseKmsHeader.DataEncryption = ret[0]
+		}
+		if ret, ok = responseHeaders[HEADER_SSEKMS_ENCRYPT_BUCKET_KEY_ENABLED]; ok {
+			ret, err := strconv.ParseBool(ret[0])
+			if err == nil {
+				sseKmsHeader.BucketKeyEnabled = ret
+			}
+		}
+		if ret, ok = responseHeaders[HEADER_SSEKMS_ENCRYPT_BUCKET_KEY_ROTATION_PERIOD]; ok {
+			ret, err := strconv.ParseInt(ret[0], 10, 64)
+			if err == nil {
+				sseKmsHeader.RotationPeriod = ret
+			}
 		}
 		sseHeader = sseKmsHeader
 	}
@@ -842,6 +894,21 @@ func ParseGetBucketMetadataOutput(output *GetBucketMetadataOutput) {
 	}
 }
 
+func ParseCreateBucketOutput(output *CreateBucketOutput) {
+	if ret, ok := output.ResponseHeaders[HEADER_LOCATION_AMZ]; ok {
+		output.Location = ret[0]
+	}
+
+	if ret, ok := output.ResponseHeaders[HEADER_DATE]; ok {
+		ret, err := time.Parse(time.RFC1123, ret[0])
+		if err == nil {
+			output.Date = ret
+		}
+	}
+
+	output.SseHeader = parseSseHeader(output.ResponseHeaders)
+}
+
 func parseContentHeader(output *SetObjectMetadataOutput) {
 	if ret, ok := output.ResponseHeaders[HEADER_CONTENT_DISPOSITION]; ok {
 		output.ContentDisposition = ret[0]
@@ -984,7 +1051,6 @@ func ParseResponseToBaseModel(resp *http.Response, baseModel IBaseModel, xmlResu
 		var body []byte
 		body, err = ioutil.ReadAll(resp.Body)
 		if err == nil && len(body) > 0 {
-
 			name := reflect.TypeOf(baseModel).Elem().Name()
 			if xmlResult {
 				err = ParseXml(body, baseModel)
@@ -997,10 +1063,10 @@ func ParseResponseToBaseModel(resp *http.Response, baseModel IBaseModel, xmlResu
 				}
 			}
 			if err != nil {
-				doLog(LEVEL_ERROR, "body: %s", body)
-				if _, ok := baseModel.(*ObsError); !ok && name == "CopyObjectOutput" {
+				if _, ok := baseModel.(*ObsError); !ok && (name == "CopyObjectOutput" || name == "CopyPartOutput") {
 					doLog(LEVEL_ERROR, "Unmarshal error: %v, try parse response to ObsError", err)
-					err = ParseResponseToObsError(resp, isObs)
+					err = ParseErrorBodyToObsError(body, resp, xmlResult, isObs)
+					return err
 				} else {
 					doLog(LEVEL_ERROR, "Unmarshal error: %v", err)
 				}
@@ -1015,6 +1081,41 @@ func ParseResponseToBaseModel(resp *http.Response, baseModel IBaseModel, xmlResu
 	baseModel.setResponseHeaders(responseHeaders)
 	if values, ok := responseHeaders[HEADER_REQUEST_ID]; ok {
 		baseModel.setRequestID(values[0])
+	}
+	return
+}
+
+// ParseErrorBodyToObsError gets obsError from OBS
+func ParseErrorBodyToObsError(body []byte, resp *http.Response, xmlResult, isObs bool) (err error) {
+	obsError := ObsError{}
+	var parseErr error
+	if xmlResult {
+		parseErr = ParseXml(body, &obsError)
+	} else {
+		parseErr = parseJSON(body, &obsError)
+	}
+
+	if parseErr != nil {
+		doLog(LEVEL_ERROR, "Failed to parse ObsError from body: %v", parseErr)
+		limit := MAX_LOG_SIZE
+		if len(body) < limit {
+			limit = len(body)
+		}
+		err = fmt.Errorf("request failed, raw body: %q", body[:limit])
+	} else {
+		obsError.Status = resp.Status
+
+		obsError.setStatusCode(resp.StatusCode)
+		responseHeaders := cleanHeaderPrefix(resp.Header, isObs)
+		obsError.setResponseHeaders(responseHeaders)
+		if values, ok := responseHeaders[HEADER_REQUEST_ID]; ok {
+			obsError.setRequestID(values[0])
+		}
+		if values, ok := responseHeaders[HEADER_ERROR_INDICATOR]; ok {
+			obsError.Indicator = values[0]
+		}
+
+		err = obsError
 	}
 	return
 }

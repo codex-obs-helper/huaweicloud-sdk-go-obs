@@ -99,14 +99,16 @@ func (obsClient ObsClient) ListBuckets(input *ListBucketsInput, extensions ...ex
 // CreateBucket creates a bucket.
 //
 // You can use this API to create a bucket and name it as you specify. The created bucket name must be unique in OBS.
-func (obsClient ObsClient) CreateBucket(input *CreateBucketInput, extensions ...extensionOptions) (output *BaseModel, err error) {
+func (obsClient ObsClient) CreateBucket(input *CreateBucketInput, extensions ...extensionOptions) (output *CreateBucketOutput, err error) {
 	if input == nil {
 		return nil, errors.New("CreateBucketInput is nil")
 	}
-	output = &BaseModel{}
+	output = &CreateBucketOutput{}
 	err = obsClient.doActionWithBucket("CreateBucket", HTTP_PUT, input.Bucket, input, output, extensions)
 	if err != nil {
 		output = nil
+	} else {
+		ParseCreateBucketOutput(output)
 	}
 	return
 }
