@@ -38,6 +38,9 @@ func newProgressEvent(eventType ProgressEventType, consumed, total int64) *Progr
 	}
 }
 
+// ProgressListener receives transfer progress callbacks.
+// Multipart upload/download may invoke ProgressChanged from multiple goroutines,
+// so implementations must be safe for concurrent use.
 type ProgressListener interface {
 	ProgressChanged(event *ProgressEvent)
 }

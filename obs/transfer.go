@@ -21,9 +21,10 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"sync"
+	"runtime"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 var errAbort = errors.New("AbortError")
@@ -138,13 +139,45 @@ func loadCheckpointFile(checkpointFile string, result interface{}) error {
 	return xml.Unmarshal(ret, result)
 }
 
-func updateCheckpointFile(fc interface{}, checkpointFilePath string) error {
-	result, err := xml.Marshal(fc)
+func updateCheckpointFile(target interface{}, filePath string) error {
+	result, err := xml.Marshal(target)
 	if err != nil {
 		return err
 	}
-	err = ioutil.WriteFile(checkpointFilePath, result, 0640)
-	return err
+	tempPath := filePath + ".tmp"
+	fd, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0640)
+	if err != nil {
+		return err
+	}
+	if _, err := fd.Write(result); err != nil {
+		_ = fd.Close()
+		return err
+	}
+	if err := fd.Sync(); err != nil {
+		_ = fd.Close()
+		return err
+	}
+	if err := fd.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, filePath); err != nil {
+		return err
+	}
+	return syncCheckpointDir(filepath.Dir(filePath))
+}
+
+func syncCheckpointDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	fd, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = fd.Close()
+	}()
+	return fd.Sync()
 }
 
 func getCheckpointFile(ufc *UploadCheckpoint, uploadFileStat os.FileInfo, input *UploadFileInput, obsClient *ObsClient, extensions []extensionOptions) (needCheckpoint bool, err error) {
@@ -174,6 +207,45 @@ func getCheckpointFile(ufc *UploadCheckpoint, uploadFileStat os.FileInfo, input 
 			doLog(LEVEL_WARN, fmt.Sprintf("Failed to remove checkpoint file with error: [%v].", _err))
 		}
 	} else {
+		// Checkpoint is valid. Optionally reconcile with OBS server state
+		// in case some parts were uploaded but async flush didn't persist them.
+		// Only performed when CheckpointReconcile is explicitly enabled.
+		if input.CheckpointReconcile {
+			reconciled := false
+			partNumberMarker := 0
+			for {
+				listPartsInput := &ListPartsInput{
+					Bucket:           input.Bucket,
+					Key:              input.Key,
+					UploadId:         ufc.UploadId,
+					MaxParts:         1000, // ListParts returns max 1000 per request
+					PartNumberMarker: partNumberMarker,
+				}
+				listPartsOutput, _err := obsClient.ListParts(listPartsInput, extensions...)
+				if _err != nil {
+					doLog(LEVEL_WARN, fmt.Sprintf("ListParts failed to reconcile checkpoint, error: %v", _err))
+					break
+				}
+				for _, part := range listPartsOutput.Parts {
+					if part.PartNumber <= len(ufc.UploadParts) {
+						if !ufc.UploadParts[part.PartNumber-1].IsCompleted {
+							ufc.UploadParts[part.PartNumber-1].IsCompleted = true
+							ufc.UploadParts[part.PartNumber-1].Etag = part.ETag
+							reconciled = true
+						}
+					}
+				}
+				if !listPartsOutput.IsTruncated {
+					break
+				}
+				partNumberMarker = listPartsOutput.NextPartNumberMarker
+			}
+			if reconciled {
+				if _err := updateCheckpointFile(ufc, checkpointFilePath); _err != nil {
+					doLog(LEVEL_WARN, fmt.Sprintf("Failed to persist reconciled checkpoint, error: %v", _err))
+				}
+			}
+		}
 		return false, nil
 	}
 
@@ -374,23 +446,21 @@ func (obsClient ObsClient) resumeUpload(input *UploadFileInput, extensions []ext
 	return completeOutput, err
 }
 
-func handleUploadTaskResult(result interface{}, ufc *UploadCheckpoint, partNum int, enableCheckpoint bool, checkpointFilePath string, lock *sync.Mutex, completedBytes *int64, listener ProgressListener) (err error) {
+func handleUploadTaskResult(result interface{}, ufc *UploadCheckpoint, partNum int, enableCheckpoint bool, checkpointFilePath string, cw *CheckpointAsyncWriter, completedBytes *int64, listener ProgressListener) (err error) {
 	if uploadPartOutput, ok := result.(*UploadPartOutput); ok {
-		lock.Lock()
-		defer lock.Unlock()
-		ufc.UploadParts[partNum-1].Etag = uploadPartOutput.ETag
-		ufc.UploadParts[partNum-1].IsCompleted = true
+		// Memory update is done asynchronously by CheckpointAsyncWriter
+		// Progress update still needs atomic operation
+		newCompleted := atomic.AddInt64(completedBytes, ufc.UploadParts[partNum-1].PartSize)
 
-		atomic.AddInt64(completedBytes, ufc.UploadParts[partNum-1].PartSize)
-
-		event := newProgressEvent(TransferDataEvent, *completedBytes, ufc.FileInfo.Size)
+		event := newProgressEvent(TransferDataEvent, newCompleted, ufc.FileInfo.Size)
 		publishProgress(listener, event)
 
-		if enableCheckpoint {
-			_err := updateCheckpointFile(ufc, checkpointFilePath)
-			if _err != nil {
-				doLog(LEVEL_WARN, "Failed to update checkpoint file with error [%v].", _err)
-			}
+		if enableCheckpoint && cw != nil {
+			cw.Submit(&UploadPartUpdate{
+				PartNumber:  partNum,
+				ETag:        uploadPartOutput.ETag,
+				IsCompleted: true,
+			})
 		}
 	} else if result != errAbort {
 		if _err, ok := result.(error); ok {
@@ -405,7 +475,19 @@ func (obsClient ObsClient) uploadPartConcurrent(ufc *UploadCheckpoint, checkpoin
 	var uploadPartError atomic.Value
 	var errFlag int32
 	var abort int32
-	lock := new(sync.Mutex)
+
+	// Create CheckpointAsyncWriter for async checkpoint updates
+	var cw *CheckpointAsyncWriter
+	if input.EnableCheckpoint {
+		opts := []AsyncWriterOption{}
+		if input.CheckpointBatchSize > 0 {
+			opts = append(opts, WithAsyncBatchSize(input.CheckpointBatchSize))
+		}
+		if input.CheckpointFlushInterval > 0 {
+			opts = append(opts, WithAsyncFlushInterval(time.Duration(input.CheckpointFlushInterval)*time.Second))
+		}
+		cw = NewCheckpointAsyncWriter(ufc, checkpointFilePath, opts...)
+	}
 
 	var completedBytes int64
 	listener := obsClient.getProgressListener(extensions)
@@ -418,8 +500,8 @@ func (obsClient ObsClient) uploadPartConcurrent(ufc *UploadCheckpoint, checkpoin
 			break
 		}
 		if uploadPart.IsCompleted {
-			atomic.AddInt64(&completedBytes, uploadPart.PartSize)
-			event := newProgressEvent(TransferDataEvent, completedBytes, ufc.FileInfo.Size)
+			newCompleted := atomic.AddInt64(&completedBytes, uploadPart.PartSize)
+			event := newProgressEvent(TransferDataEvent, newCompleted, ufc.FileInfo.Size)
 			publishProgress(listener, event)
 			continue
 		}
@@ -441,7 +523,7 @@ func (obsClient ObsClient) uploadPartConcurrent(ufc *UploadCheckpoint, checkpoin
 		}
 		pool.ExecuteFunc(func() interface{} {
 			result := task.Run()
-			err := handleUploadTaskResult(result, ufc, task.PartNumber, input.EnableCheckpoint, input.CheckpointFile, lock, &completedBytes, listener)
+			err := handleUploadTaskResult(result, ufc, task.PartNumber, input.EnableCheckpoint, input.CheckpointFile, cw, &completedBytes, listener)
 			if err != nil && atomic.CompareAndSwapInt32(&errFlag, 0, 1) {
 				uploadPartError.Store(err)
 			}
@@ -449,15 +531,28 @@ func (obsClient ObsClient) uploadPartConcurrent(ufc *UploadCheckpoint, checkpoin
 		})
 	}
 	pool.ShutDown()
+
+	// Force sync flush to ensure all pending items are persisted to disk
+	// before shutdown. This minimizes data loss on crash.
+	if cw != nil {
+		cw.SyncFlush()
+	}
+
 	if err, ok := uploadPartError.Load().(error); ok {
 
 		event := newProgressEvent(TransferFailedEvent, completedBytes, ufc.FileInfo.Size)
 		publishProgress(listener, event)
 
+		if cw != nil {
+			cw.Shutdown()
+		}
 		return err
 	}
 	event = newProgressEvent(TransferCompletedEvent, completedBytes, ufc.FileInfo.Size)
 	publishProgress(listener, event)
+	if cw != nil {
+		cw.Shutdown()
+	}
 	return nil
 }
 
@@ -839,22 +934,20 @@ func updateDownloadFile(filePath string, rangeStart int64, output *GetObjectOutp
 	return nil
 }
 
-func handleDownloadTaskResult(result interface{}, dfc *DownloadCheckpoint, partNum int64, enableCheckpoint bool, checkpointFile string, lock *sync.Mutex, completedBytes *int64, listener ProgressListener) (err error) {
+func handleDownloadTaskResult(result interface{}, dfc *DownloadCheckpoint, partNum int64, enableCheckpoint bool, checkpointFile string, cw *CheckpointAsyncWriter, completedBytes *int64, listener ProgressListener) (err error) {
 	if output, ok := result.(*GetObjectOutput); ok {
-		lock.Lock()
-		defer lock.Unlock()
-		dfc.DownloadParts[partNum-1].IsCompleted = true
+		// Memory update is done asynchronously by CheckpointAsyncWriter
+		// Progress update still needs atomic operation
+		newCompleted := atomic.AddInt64(completedBytes, output.ContentLength)
 
-		atomic.AddInt64(completedBytes, output.ContentLength)
-
-		event := newProgressEvent(TransferDataEvent, *completedBytes, dfc.ObjectInfo.Size)
+		event := newProgressEvent(TransferDataEvent, newCompleted, dfc.ObjectInfo.Size)
 		publishProgress(listener, event)
 
-		if enableCheckpoint {
-			_err := updateCheckpointFile(dfc, checkpointFile)
-			if _err != nil {
-				doLog(LEVEL_WARN, "Failed to update checkpoint file with error [%v].", _err)
-			}
+		if enableCheckpoint && cw != nil {
+			cw.Submit(&DownloadPartUpdate{
+				PartNumber:  int(partNum),
+				IsCompleted: true,
+			})
 		}
 	} else if result != errAbort {
 		if _err, ok := result.(error); ok {
@@ -869,7 +962,19 @@ func (obsClient ObsClient) downloadFileConcurrent(input *DownloadFileInput, dfc 
 	var downloadPartError atomic.Value
 	var errFlag int32
 	var abort int32
-	lock := new(sync.Mutex)
+
+	// Create CheckpointAsyncWriter for async checkpoint updates
+	var cw *CheckpointAsyncWriter
+	if input.EnableCheckpoint {
+		opts := []AsyncWriterOption{}
+		if input.CheckpointBatchSize > 0 {
+			opts = append(opts, WithAsyncBatchSize(input.CheckpointBatchSize))
+		}
+		if input.CheckpointFlushInterval > 0 {
+			opts = append(opts, WithAsyncFlushInterval(time.Duration(input.CheckpointFlushInterval)*time.Second))
+		}
+		cw = NewCheckpointAsyncWriter(dfc, input.CheckpointFile, opts...)
+	}
 
 	var completedBytes int64
 	listener := obsClient.getProgressListener(extensions)
@@ -882,8 +987,8 @@ func (obsClient ObsClient) downloadFileConcurrent(input *DownloadFileInput, dfc 
 			break
 		}
 		if downloadPart.IsCompleted {
-			atomic.AddInt64(&completedBytes, downloadPart.RangeEnd-downloadPart.Offset+1)
-			event := newProgressEvent(TransferDataEvent, completedBytes, dfc.ObjectInfo.Size)
+			newCompleted := atomic.AddInt64(&completedBytes, downloadPart.RangeEnd-downloadPart.Offset+1)
+			event := newProgressEvent(TransferDataEvent, newCompleted, dfc.ObjectInfo.Size)
 			publishProgress(listener, event)
 			continue
 		}
@@ -906,7 +1011,7 @@ func (obsClient ObsClient) downloadFileConcurrent(input *DownloadFileInput, dfc 
 		}
 		pool.ExecuteFunc(func() interface{} {
 			result := task.Run()
-			err := handleDownloadTaskResult(result, dfc, task.partNumber, input.EnableCheckpoint, input.CheckpointFile, lock, &completedBytes, listener)
+			err := handleDownloadTaskResult(result, dfc, task.partNumber, input.EnableCheckpoint, input.CheckpointFile, cw, &completedBytes, listener)
 			if err != nil && atomic.CompareAndSwapInt32(&errFlag, 0, 1) {
 				downloadPartError.Store(err)
 			}
@@ -914,12 +1019,25 @@ func (obsClient ObsClient) downloadFileConcurrent(input *DownloadFileInput, dfc 
 		})
 	}
 	pool.ShutDown()
+
+	// Force sync flush to ensure all pending items are persisted to disk
+	// before shutdown. This minimizes data loss on crash.
+	if cw != nil {
+		cw.SyncFlush()
+	}
+
 	if err, ok := downloadPartError.Load().(error); ok {
 		event := newProgressEvent(TransferFailedEvent, completedBytes, dfc.ObjectInfo.Size)
 		publishProgress(listener, event)
+		if cw != nil {
+			cw.Shutdown()
+		}
 		return err
 	}
 	event = newProgressEvent(TransferCompletedEvent, completedBytes, dfc.ObjectInfo.Size)
 	publishProgress(listener, event)
+	if cw != nil {
+		cw.Shutdown()
+	}
 	return nil
 }

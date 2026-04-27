@@ -327,27 +327,32 @@ type CopyObjectOutput struct {
 // UploadFileInput is the input parameter of UploadFile function
 type UploadFileInput struct {
 	ObjectOperationInput
-	UploadFile       string
-	PartSize         int64
-	TaskNum          int
-	EnableCheckpoint bool
-	CheckpointFile   string
-	EncodingType     string
+	UploadFile              string
+	PartSize                int64
+	TaskNum                 int
+	EnableCheckpoint        bool
+	CheckpointFile          string
+	CheckpointBatchSize     int   // batch size for async checkpoint writer, configurable by user
+	CheckpointFlushInterval int64 // flush interval in seconds for async checkpoint writer, configurable by user
+	CheckpointReconcile     bool  // whether to reconcile with OBS ListParts on load (default false)
+	EncodingType            string
 	HttpHeader
 }
 
 // DownloadFileInput is the input parameter of DownloadFile function
 type DownloadFileInput struct {
 	GetObjectMetadataInput
-	IfMatch           string
-	IfNoneMatch       string
-	IfModifiedSince   time.Time
-	IfUnmodifiedSince time.Time
-	DownloadFile      string
-	PartSize          int64
-	TaskNum           int
-	EnableCheckpoint  bool
-	CheckpointFile    string
+	IfMatch                 string
+	IfNoneMatch             string
+	IfModifiedSince         time.Time
+	IfUnmodifiedSince       time.Time
+	DownloadFile            string
+	PartSize                int64
+	TaskNum                 int
+	EnableCheckpoint        bool
+	CheckpointFile          string
+	CheckpointBatchSize     int   // batch size for async checkpoint writer, configurable by user
+	CheckpointFlushInterval int64 // flush interval in seconds for async checkpoint writer, configurable by user
 }
 
 type AppendObjectInput struct {
