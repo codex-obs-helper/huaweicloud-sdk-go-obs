@@ -39,6 +39,11 @@ type ListPosixObjectsInput struct {
 	ListObjectsInput
 }
 
+type Tagging struct {
+	XMLName xml.Name `xml:"Tagging"`
+	Tags    []Tag    `xml:"TagSet>Tag"`
+}
+
 // ListObjectsOutput is the result of ListObjects function
 type ListObjectsOutput struct {
 	BaseModel
@@ -412,6 +417,46 @@ type SetObjectMetadataInput struct {
 	StorageClass            StorageClassType
 	Metadata                map[string]string
 	HttpHeader
+}
+
+type ObjectTaggingInput struct {
+	Bucket    string
+	Key       string
+	VersionId string
+}
+
+// GetObjectTaggingInput is the input parameter of GetObjectTagging function
+type GetObjectTaggingInput struct {
+	ObjectTaggingInput
+}
+
+// SetObjectTaggingInput is the input parameter of SetObjectTagging function
+type SetObjectTaggingInput struct {
+	ObjectTaggingInput
+	Tags []Tag
+}
+
+type DeleteObjectTaggingInput struct {
+	ObjectTaggingInput
+}
+
+type ObjectTaggingOutput struct {
+	BaseModel
+	VersionId string
+}
+
+type GetObjectTaggingOutput struct {
+	ObjectTaggingOutput
+	XMLName xml.Name `xml:"Tagging"`
+	Tags    []Tag    `xml:"TagSet>Tag"`
+}
+
+type SetObjectTaggingOutput struct {
+	ObjectTaggingOutput
+}
+
+type DeleteObjectTaggingOutput struct {
+	ObjectTaggingOutput
 }
 
 // SetObjectMetadataOutput is the result of SetObjectMetadata function

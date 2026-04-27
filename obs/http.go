@@ -478,6 +478,11 @@ func handleBody(req *http.Request, body io.Reader, listener ProgressListener, tr
 		readerLen, err := GetReaderLen(reader)
 		if err == nil {
 			req.ContentLength = readerLen
+
+			// Support Content-Length in Go for uploads, including zero-length scenarios.
+			if req.Method == http.MethodPut && readerLen == 0 {
+				reader = nil
+			}
 		}
 		if req.ContentLength > 0 {
 			req.Header.Set(HEADER_CONTENT_LENGTH_CAMEL, strconv.FormatInt(req.ContentLength, 10))

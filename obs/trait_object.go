@@ -155,7 +155,7 @@ func (input GetObjectMetadataInput) trans(isObs bool) (params map[string]string,
 	if input.RequestHeader != "" {
 		headers[HEADER_ACCESS_CONTROL_REQUEST_HEADER_CAMEL] = []string{input.RequestHeader}
 	}
-	setSseHeader(headers, input.SseHeader, true, isObs)
+	setSseHeader(headers, input.SseHeader, true, false, isObs)
 	return
 }
 
@@ -196,6 +196,37 @@ func (input SetObjectMetadataInput) prepareStorageClass(headers map[string][]str
 		}
 		setHeaders(headers, HEADER_STORAGE_CLASS2, []string{storageClass}, isObs)
 	}
+}
+
+func buildTaggingBaseParamsAndHeaders(versionId string) (map[string]string, map[string][]string) {
+	params := map[string]string{string(SubResourceTagging): ""}
+	if versionId != "" {
+		params[PARAM_VERSION_ID] = versionId
+	}
+	headers := make(map[string][]string)
+	return params, headers
+}
+
+func (input GetObjectTaggingInput) trans(isObs bool) (params map[string]string, headers map[string][]string, data interface{}, err error) {
+	params, headers = buildTaggingBaseParamsAndHeaders(input.VersionId)
+	return
+}
+
+func (input SetObjectTaggingInput) trans(isObs bool) (params map[string]string, headers map[string][]string, data interface{}, err error) {
+	params, headers = buildTaggingBaseParamsAndHeaders(input.VersionId)
+
+	data, md5, e := ConvertObjectTagsToXml(input.Tags, true)
+	if e != nil {
+		err = e
+		return
+	}
+	headers[HEADER_MD5_CAMEL] = []string{md5}
+	return
+}
+
+func (input DeleteObjectTaggingInput) trans(isObs bool) (params map[string]string, headers map[string][]string, data interface{}, err error) {
+	params, headers = buildTaggingBaseParamsAndHeaders(input.VersionId)
+	return
 }
 
 func (input SetObjectMetadataInput) trans(isObs bool) (params map[string]string, headers map[string][]string, data interface{}, err error) {
@@ -317,7 +348,7 @@ func (input ObjectOperationInput) trans(isObs bool) (params map[string]string, h
 		setHeaders(headers, HEADER_WEBSITE_REDIRECT_LOCATION, []string{input.WebsiteRedirectLocation}, isObs)
 
 	}
-	setSseHeader(headers, input.SseHeader, false, isObs)
+	setSseHeader(headers, input.SseHeader, false, false, isObs)
 	if input.Expires != 0 {
 		setHeaders(headers, HEADER_EXPIRES, []string{Int64ToString(input.Expires)}, true)
 	}

@@ -77,7 +77,7 @@ func (input InitiateMultipartUploadInput) trans(isObs bool) (params map[string]s
 func (input UploadPartInput) trans(isObs bool) (params map[string]string, headers map[string][]string, data interface{}, err error) {
 	params = map[string]string{"uploadId": input.UploadId, "partNumber": IntToString(input.PartNumber)}
 	headers = make(map[string][]string)
-	setSseHeader(headers, input.SseHeader, true, isObs)
+	setSseHeader(headers, input.SseHeader, true, false, isObs)
 	if input.ContentMD5 != "" {
 		headers[HEADER_MD5_CAMEL] = []string{input.ContentMD5}
 	}
@@ -129,7 +129,7 @@ func (input CopyPartInput) trans(isObs bool) (params map[string]string, headers 
 	if input.CopySourceRange != "" {
 		setHeaders(headers, HEADER_COPY_SOURCE_RANGE, []string{input.CopySourceRange}, isObs)
 	}
-	setSseHeader(headers, input.SseHeader, true, isObs)
+	setSseHeader(headers, input.SseHeader, true, false, isObs)
 	if input.SourceSseHeader != nil {
 		if sseCHeader, ok := input.SourceSseHeader.(SseCHeader); ok {
 			setHeaders(headers, HEADER_SSEC_COPY_SOURCE_ENCRYPTION, []string{sseCHeader.GetEncryption()}, isObs)

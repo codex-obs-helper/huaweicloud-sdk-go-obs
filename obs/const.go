@@ -13,7 +13,7 @@
 package obs
 
 const (
-	OBS_SDK_VERSION        = "3.25.9"
+	OBS_SDK_VERSION        = "3.26.3"
 	USER_AGENT             = "obs-sdk-go/" + OBS_SDK_VERSION
 	HEADER_PREFIX          = "x-amz-"
 	HEADER_PREFIX_META     = "x-amz-meta-"
@@ -101,9 +101,13 @@ const (
 	HEADER_SSEC_KEY        = "server-side-encryption-customer-key"
 	HEADER_SSEC_KEY_MD5    = "server-side-encryption-customer-key-MD5"
 
-	HEADER_SSEKMS_ENCRYPTION      = "server-side-encryption"
-	HEADER_SSEKMS_KEY             = "server-side-encryption-aws-kms-key-id"
-	HEADER_SSEKMS_ENCRYPT_KEY_OBS = "server-side-encryption-kms-key-id"
+	HEADER_SSEKMS_ENCRYPTION                         = "server-side-encryption"
+	HEADER_SSEKMS_DATA_ENCRYPTION                    = "server-side-data-encryption"
+	HEADER_SSEKMS_KEY                                = "server-side-encryption-aws-kms-key-id"
+	HEADER_SSEKMS_ENCRYPT_KEY_OBS                    = "server-side-encryption-kms-key-id"
+	HEADER_SSEKMS_KEY_PROJECT                        = "sse-kms-key-project-id"
+	HEADER_SSEKMS_ENCRYPT_BUCKET_KEY_ENABLED         = "server-side-encryption-bucket-key-enabled"
+	HEADER_SSEKMS_ENCRYPT_BUCKET_KEY_ROTATION_PERIOD = "server-side-encryption-bucket-key-rotation-period"
 
 	HEADER_SSEC_COPY_SOURCE_ENCRYPTION = "copy-source-server-side-encryption-customer-algorithm"
 	HEADER_SSEC_COPY_SOURCE_KEY        = "copy-source-server-side-encryption-customer-key"
@@ -118,6 +122,7 @@ const (
 	headerFSFileInterface = "fs-file-interface"
 
 	HEADER_DATE_CAMEL                          = "Date"
+	HEADER_DATE                                = "date"
 	HEADER_HOST_CAMEL                          = "Host"
 	HEADER_HOST                                = "host"
 	HEADER_AUTH_CAMEL                          = "Authorization"
@@ -200,6 +205,7 @@ const (
 	MIN_PART_SIZE     = 100 * 1024
 	DEFAULT_PART_SIZE = 9 * 1024 * 1024
 	MAX_PART_NUM      = 10000
+	MAX_LOG_SIZE      = 1000
 
 	GET_OBJECT                  = "GetObject"
 	PUT_OBJECT                  = "PutObject"
