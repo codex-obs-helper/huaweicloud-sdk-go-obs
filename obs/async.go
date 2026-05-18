@@ -16,6 +16,7 @@
 package obs
 
 import (
+	"errors"
 	"sync"
 	"time"
 )
@@ -36,7 +37,6 @@ type AsyncWriter struct {
 	ch            chan AsyncItem
 	done          chan struct{}
 	flushReq      chan chan error
-	pendingReq    chan chan []AsyncItem
 	items         []AsyncItem
 	batchSize     int           // TODO: to be determined by performance testing, temp value 5
 	flushInterval time.Duration // TODO: to be determined by performance testing, temp value 5s
@@ -84,7 +84,6 @@ func NewAsyncWriter(target interface{}, flusher AsyncFlusher, opts ...AsyncWrite
 		ch:            make(chan AsyncItem, 50), // default 50, Checkpoint uses 10000
 		done:          make(chan struct{}),
 		flushReq:      make(chan chan error),
-		pendingReq:    make(chan chan []AsyncItem),
 		items:         make([]AsyncItem, 0, 100),
 		batchSize:     5,               // TODO: to be determined by perf testing, temp value
 		flushInterval: 5 * time.Second, // TODO: to be determined by perf testing, temp value
@@ -143,11 +142,6 @@ func (aw *AsyncWriter) run() {
 			aw.drainChannel()
 			resultCh <- aw.doFlush()
 
-		case resultCh := <-aw.pendingReq:
-			items := make([]AsyncItem, len(aw.items))
-			copy(items, aw.items)
-			resultCh <- items
-
 		case <-aw.done:
 			// drain remaining items in channel, then flush
 			aw.drainChannel()
@@ -178,30 +172,27 @@ func (aw *AsyncWriter) doFlush() error {
 	aw.items = make([]AsyncItem, 0, aw.batchSize)
 
 	// apply and file write are both handled by Flusher
-	return aw.flusher.Flush(items)
+	if err := aw.flusher.Flush(items); err != nil {
+		// Restore items to aw.items on failure so no data is lost
+		aw.items = append(aw.items, items...)
+		return err
+	}
+	return nil
 }
 
 // SyncFlush forces a synchronous flush of all pending items.
 // Called before shutdown to ensure no data loss on crash.
-func (aw *AsyncWriter) SyncFlush() {
+// Returns error if flush fails; items are preserved in buffer for retry.
+func (aw *AsyncWriter) SyncFlush() error {
 	resultCh := make(chan error, 1)
 	select {
 	case aw.flushReq <- resultCh:
 		if err := <-resultCh; err != nil {
 			doLog(LEVEL_ERROR, "sync flush failed: %v", err)
+			return err
 		}
-	case <-aw.done:
-		return
-	}
-}
-
-// GetPendingItems returns a copy of currently buffered items
-func (aw *AsyncWriter) GetPendingItems() []AsyncItem {
-	resultCh := make(chan []AsyncItem, 1)
-	select {
-	case aw.pendingReq <- resultCh:
-		return <-resultCh
-	case <-aw.done:
 		return nil
+	case <-aw.done:
+		return errors.New("async writer already shut down")
 	}
 }

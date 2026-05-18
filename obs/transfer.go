@@ -207,45 +207,6 @@ func getCheckpointFile(ufc *UploadCheckpoint, uploadFileStat os.FileInfo, input 
 			doLog(LEVEL_WARN, fmt.Sprintf("Failed to remove checkpoint file with error: [%v].", _err))
 		}
 	} else {
-		// Checkpoint is valid. Optionally reconcile with OBS server state
-		// in case some parts were uploaded but async flush didn't persist them.
-		// Only performed when CheckpointReconcile is explicitly enabled.
-		if input.CheckpointReconcile {
-			reconciled := false
-			partNumberMarker := 0
-			for {
-				listPartsInput := &ListPartsInput{
-					Bucket:           input.Bucket,
-					Key:              input.Key,
-					UploadId:         ufc.UploadId,
-					MaxParts:         1000, // ListParts returns max 1000 per request
-					PartNumberMarker: partNumberMarker,
-				}
-				listPartsOutput, _err := obsClient.ListParts(listPartsInput, extensions...)
-				if _err != nil {
-					doLog(LEVEL_WARN, fmt.Sprintf("ListParts failed to reconcile checkpoint, error: %v", _err))
-					break
-				}
-				for _, part := range listPartsOutput.Parts {
-					if part.PartNumber <= len(ufc.UploadParts) {
-						if !ufc.UploadParts[part.PartNumber-1].IsCompleted {
-							ufc.UploadParts[part.PartNumber-1].IsCompleted = true
-							ufc.UploadParts[part.PartNumber-1].Etag = part.ETag
-							reconciled = true
-						}
-					}
-				}
-				if !listPartsOutput.IsTruncated {
-					break
-				}
-				partNumberMarker = listPartsOutput.NextPartNumberMarker
-			}
-			if reconciled {
-				if _err := updateCheckpointFile(ufc, checkpointFilePath); _err != nil {
-					doLog(LEVEL_WARN, fmt.Sprintf("Failed to persist reconciled checkpoint, error: %v", _err))
-				}
-			}
-		}
 		return false, nil
 	}
 
@@ -535,7 +496,11 @@ func (obsClient ObsClient) uploadPartConcurrent(ufc *UploadCheckpoint, checkpoin
 	// Force sync flush to ensure all pending items are persisted to disk
 	// before shutdown. This minimizes data loss on crash.
 	if cw != nil {
-		cw.SyncFlush()
+		if err := cw.SyncFlush(); err != nil {
+			doLog(LEVEL_ERROR, "failed to flush checkpoint before shutdown: %v", err)
+			cw.Shutdown()
+			return err
+		}
 	}
 
 	if err, ok := uploadPartError.Load().(error); ok {
@@ -1023,7 +988,11 @@ func (obsClient ObsClient) downloadFileConcurrent(input *DownloadFileInput, dfc 
 	// Force sync flush to ensure all pending items are persisted to disk
 	// before shutdown. This minimizes data loss on crash.
 	if cw != nil {
-		cw.SyncFlush()
+		if err := cw.SyncFlush(); err != nil {
+			doLog(LEVEL_ERROR, "failed to flush checkpoint before shutdown: %v", err)
+			cw.Shutdown()
+			return err
+		}
 	}
 
 	if err, ok := downloadPartError.Load().(error); ok {

@@ -75,8 +75,9 @@ func (cw *CheckpointAsyncWriter) Shutdown() {
 
 // SyncFlush forces a synchronous flush of all pending items to disk.
 // Called before shutdown to ensure no data loss on crash.
-func (cw *CheckpointAsyncWriter) SyncFlush() {
-	cw.async.SyncFlush()
+// Returns error if flush fails; items are preserved in buffer for retry.
+func (cw *CheckpointAsyncWriter) SyncFlush() error {
+	return cw.async.SyncFlush()
 }
 
 // checkpointFlusher implements AsyncFlusher interface

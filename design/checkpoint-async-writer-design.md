@@ -47,127 +47,132 @@
 |------|--------|--------|
 | **内存更新** | 同步 lock | 异步提交到 channel |
 | **文件写入** | 同步每次 flush | 批量 flush（batchSize 或 interval 触发） |
-| **崩溃恢复** | 依赖上次成功刷盘 | SyncFlush + ListParts 对账 |
+| **崩溃恢复** | 依赖上次成功刷盘 | SyncFlush 强制刷盘 |
 
 ### 2.2 上传流程（带 checkpoint）
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         UploadFile Flow                                  │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                    UploadFile 完整流程                          │
+└─────────────────────────────────────────────────────────────────┘
 
-                               start
-                                 │
-                                 ▼
-                    ┌────────────────────────┐
-                    │ getCheckpointFile()   │
-                    └────────────────────────┘
-                                 │
-                    ┌────────────┴────────────┐
-                    │                         │
-               checkpoint               checkpoint
-                不存在                    存在
-                    │                         │
-                    ▼                         ▼
-           prepareUpload()           ┌───────────────┐
-                    │               │   isValid()   │
-                    │               └───────────────┘
-                    │                    │
-                    │          ┌─────────┴─────────┐
-                    │          │                   │
-                    │        valid              invalid
-                    │          │                   │
-                    │          │                   ▼
-                    │          │        abortTask() + remove
-                    │          │              │
-                    │          │              ▼
-                    │          │      prepareUpload()
-                    │          │              │
-                    └──────────┴──────────────┘
-                                 │
-                                 ▼
-              ┌─────────────────────────────────┐
-              │ CheckpointReconcile == true ?   │
-              └─────────────────────────────────┘
-                           │
-                 ┌──────────┴──────────┐
-                 │                     │
-                 yes                   no
-                 │                     │
-                 ▼                     │
-        ┌───────────────┐              │
-        │  ListParts   │              │
-        │  (分页获取)   │              │
-        │  reconcile   │              │
-        └───────────────┘              │
-                 │                     │
-                 └──────────┬──────────┘
-                            │
-                            ▼
-                   resumeUpload()
-                            │
-                            ▼
-              ┌──────────────────────────┐
-              │   uploadPartConcurrent    │
-              │  ──────────────────────  │
-              │  1. 创建 CheckpointAsyncWriter │
-              │  2. 并发执行所有 parts       │
-              │  3. part完成 → Submit()     │
-              │     到 channel            │
-              └──────────────────────────┘
-                            │
-                            ▼
-                   pool.ShutDown()
-                            │
-                            ▼
-                    cw.SyncFlush()
-                 (强制同步刷盘)
-                            │
-                            ▼
-              completeMultipartUpload()
-                            │
-                            ▼
-                              end
+                           start
+                             │
+                             ▼
+              ┌──────────────────────────────┐
+              │      getCheckpointFile()      │
+              └──────────────────────────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              │                               │
+         needCheckpoint=true            needCheckpoint=false
+              │                               │
+              ▼                               │
+      ┌──────────────┐                       │
+      │prepareUpload │                       │
+      │  + 写盘      │                       │
+      └──────────────┘                       │
+              │                               │
+              └──────────────┬───────────────┘
+                             │
+                             ▼
+              ┌──────────────────────────────┐
+              │   uploadPartConcurrent()      │
+              │  ┌─────────────────────────┐  │
+              │  │ 1. 创建 CheckpointAsyncWriter │ │
+              │  │ 2. 并发执行所有 parts   │  │
+              │  │ 3. part完成→Submit()  │  │
+              │  │ 4. pool.ShutDown()    │  │  ← 内部
+              │  │ 5. cw.SyncFlush()     │  │  ← 强制刷盘
+              │  └─────────────────────────┘  │
+              └──────────────────────────────┘
+                             │
+                             ▼
+                 completeMultipartUpload()
+                             │
+                             ▼
+                            end
+```
+
+**resumeUpload() 调用 uploadPartConcurrent() 的完整链路**：
+
+```
+resumeUpload()
+     │
+     ├── getCheckpointFile()
+     │       │
+     │       ├─ checkpoint 不存在/无效 → needCheckpoint=true
+     │       │       │
+     │       │       └── prepareUpload() + 写盘
+     │       │
+     │       └─ checkpoint 存在且有效 → needCheckpoint=false
+     │
+     ├── uploadPartConcurrent()
+     │       │
+     │       ├─ 创建 CheckpointAsyncWriter
+     │       ├─ 并发执行所有 parts，part完成 → Submit() 到 channel
+     │       ├─ pool.ShutDown()           ← 内部步骤
+     │       └─ cw.SyncFlush()            ← 强制同步刷盘
+     │
+     └── completeMultipartUpload()
 ```
 
 **流程说明**：
 
-1. **Checkpoint 加载阶段**：读取本地 checkpoint 文件，验证有效性
-2. **Reconcile 阶段**（可选）：调用 OBS ListParts 与服务端状态比对
+1. **Checkpoint 加载阶段**：`getCheckpointFile()` 读取本地 checkpoint 文件，验证有效性
+2. **准备阶段**：需要新 checkpoint 时调用 `prepareUpload()` + 写盘
 3. **并发上传阶段**：创建 CheckpointAsyncWriter，并发执行所有 parts
-4. **刷盘阶段**：pool.ShutDown() 后强制 SyncFlush，确保所有 pending items 落盘
-5. **完成阶段**：调用 CompleteMultipartUpload 完成上传
+4. **内部刷盘阶段**：`uploadPartConcurrent()` 内部执行 `pool.ShutDown()` + `cw.SyncFlush()`
+5. **完成阶段**：调用 `CompleteMultipartUpload` 完成上传
 
 ### 2.3 SyncFlush 时序
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                       SyncFlush Timeline                                 │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                      SyncFlush 时序图                            │
+└─────────────────────────────────────────────────────────────────┘
 
-  Worker1: ──[part1 done]───────────────────────────[Submit]──────────┐
-  Worker2: ──[part2 done]───────────────────────────[Submit]────────┤
-  Worker3: ──[part3 done]───────────────────────────[Submit]────────┤
-  ...                                                             │
-                                                                    │
-  Channel:  [item1] [item2] [item3] ...                            │
-                                                                    │
-  pool.ShutDown():              [drain]────────────────────────────┤
-                                                                    │
-  cw.SyncFlush():   ────────────[强制刷盘]─────────────────────────┤
-                                                                    │
-  checkpoint文件:   ────────────[已更新]────────────────────────────┘
+  线程/变量      │                    │                    │
+  ──────────────┼────────────────────┼────────────────────┤
+  Workers       │ ─[part1]─Submit──→ │                    │
+                │ ─[part2]─Submit──→ │                    │
+                │ ─[part3]─Submit──→ │                    │
+  ──────────────┼────────────────────┼────────────────────┤
+  run()         │ ←──消费──→          │ ←──消费──→         │
+  ──────────────┼────────────────────┼────────────────────┤
+  Channel       │ [item1][item2][item3]                 │
+  ──────────────┼────────────────────┼────────────────────┤
+  pool.ShutDown │ ────────────────────[完成]───────────────│
+  ──────────────┼────────────────────┼────────────────────┤
+  cw.SyncFlush  │                    │ ←─[flushReq]───────┤
+  ──────────────┼────────────────────┼────────────────────┤
+  run() (flush) │                    │ ←──[drain+flush]───│→ ACK
+  ──────────────┼────────────────────┼────────────────────┤
+  checkpoint    │                    │         [已更新]─────│→ ACK
+  ──────────────┼────────────────────┼────────────────────┤
+  cw.Shutdown   │                    │                    │ [完成]
 
 Timeline:
-  T=0: part1 完成, Submit() → channel
-  T=1: part2 完成, Submit() → channel
-  T=2: part3 完成, Submit() → channel
-  T=3: pool.ShutDown() 开始
-  T=4: 所有 task 完成
-  T=5: pool.ShutDown() 完成
-  T=6: cw.SyncFlush() 被调用（所有 pending items 刷盘）
-  T=7: cw.Shutdown() 完成
+  T=0   : part1 完成 → Submit(item1) → channel
+  T=0.1 : run() 消费 item1 → aw.items
+  T=1   : part2 完成 → Submit(item2) → channel
+  T=1.1 : run() 消费 item2 → aw.items
+  T=n   : pool.ShutDown() 开始
+  T=n+1 : 所有 task 完成，pool.ShutDown() 完成
+  T=n+2 : cw.SyncFlush() 被调用
+          ├─ 发送 flushReq 到 run()
+          ├─ run() drainChannel() 把剩余 items 移到 aw.items
+          ├─ doFlush() 写入磁盘
+          └─ 返回 ACK，SyncFlush() 解除阻塞
+  T=n+3 : cw.Shutdown() 完成
 ```
+
+**关键说明**：
+
+1. **run() goroutine 始终并发消费 channel**：worker 提交和 run() 消费并发运行
+2. **pool.ShutDown() 只等待 worker 完成**：不消费 channel，不等待 run()
+3. **SyncFlush() 是串行化点**：调用方阻塞等待，直到 run() drain + flush 完成才返回
+4. **drain 的执行者是 run() goroutine**：不是 pool.ShutDown()
 
 ---
 
@@ -177,44 +182,39 @@ Timeline:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      AsyncWriter Architecture                    │
+│                      AsyncWriter 架构                            │
 └─────────────────────────────────────────────────────────────────┘
 
-                        ┌─────────────────┐
-                        │   AsyncWriter    │
-                        │  ┌───────────┐  │
+                       ┌─────────────────┐
+                       │   AsyncWriter    │
+                       │  ┌───────────┐  │
   Submit(item) ────────▶│  │   channel  │  │───────┐
-                        │  │  (buffer)  │  │       │
-                        │  └───────────┘  │       │
-                        │       │         │       │
-                        │       ▼         │       │
-                        │  ┌─────────┐    │       │
-                        │  │  items  │    │       │  doFlush()
-                        │  │ (slice) │    │       │──────────▶ Flusher
-                        │  └─────────┘    │       │              │
-                        │       │         │       │              ▼
-                        │       │         │       │    ┌───────────────┐
-                        │  ┌────┴────┐    │       │    │ updateCheckpoint│
-                        │  │  mu     │    │       │    │     File()      │
-                        │  │ (mutex) │    │       │    └───────────────┘
-                        │  └─────────┘    │       │
-                        └─────────────────┘       │
-                               │                 │
-                               ▼                 │
-                        ┌─────────────┐         │
-                        │  run() goroutine     │
-                        │  ─────────  │         │
-                        │  select {   │         │
-                        │    channel  │         │
-                        │    ticker   │         │
-                        │    done     │         │
-                        │  }          │         │
-                        └─────────────┘         │
-                               │                 │
-                               ▼                 │
-                        ┌─────────────┐         │
-                        │  Shutdown() │─────────┘
-                        └─────────────┘
+                       │  │  (buffer)  │  │       │
+                       │  └───────────┘  │       │
+                       │       │         │       │
+                       │       ▼         │       │  doFlush()
+                       │  ┌─────────┐    │       │──────────▶ Flusher
+                       │  │  items  │    │       │              │
+                       │  │ (slice) │    │       │              ▼
+                       │  └─────────┘    │       │    ┌───────────────┐
+                       └─────────────────┘       │    │updateCheckpoint│
+                              │                    │    │    File()      │
+                              ▼                    │    └───────────────┘
+                       ┌─────────────┐         │
+                       │ run() goroutine      │
+                       │ ──────────────────    │
+                       │ select {              │
+                       │   channel            │  ← 接收 Submit
+                       │   ticker             │  ← 定时触发
+                       │   flushReq           │  ← SyncFlush 强制触发
+                       │   done               │  ← Shutdown
+                       │ }                     │
+                       └─────────────┘         │
+                              │                │
+                              ▼                │
+                       ┌─────────────┐         │
+                       │  Shutdown() │─────────┘
+                       └─────────────┘
 ```
 
 **设计说明**：
@@ -232,69 +232,159 @@ Timeline:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│               CheckpointAsyncWriter Architecture                 │
+│                 CheckpointAsyncWriter 架构                       │
 └─────────────────────────────────────────────────────────────────┘
 
-  ┌───────────────────────────────────────────────────────┐
-  │            CheckpointAsyncWriter                      │
-  │  ┌─────────────────────────────────────────────────┐ │
-  │  │              AsyncWriter                         │ │
-  │  │  ┌─────────┐   ┌─────────┐   ┌───────────────┐  │ │
-  │  │  │ channel │──▶│  items  │──▶│  doFlush()    │  │ │
-  │  │  └─────────┘   └─────────┘   └───────┬───────┘  │ │
-  │  └─────────────────────────────────────│──────────┘ │
-  │                                          │            │
-  └──────────────────────────────────────────│────────────┘
-                                               │
-                                               ▼
-                                    ┌─────────────────────┐
-                                    │ checkpointFlusher    │
-                                    │  ────────────────   │
-                                    │  1. Apply(items)    │
-                                    │  2. updateCheckpoint│
-                                    │      File()         │
-                                    └─────────────────────┘
+  ┌─────────────────────────────────────────────────────────────┐
+  │                   CheckpointAsyncWriter                      │
+  │                                                             │
+  │  ┌───────────────────────────────────────────────────────┐  │
+  │  │                    AsyncWriter                        │  │
+  │  │  ┌─────────┐   ┌──────────────┐   ┌───────────────┐   │  │
+  │  │  │ channel │──▶│    items     │──▶│   doFlush()   │   │  │
+  │  │  └─────────┘   └──────────────┘   └───────┬───────┘   │  │
+  │  └─────────────────────────────────────────────│───────────┘  │
+  │                                                  │            │
+  └──────────────────────────────────────────────────│────────────┘
+                                                       │
+                                                       ▼
+                                          ┌─────────────────────┐
+                                          │  checkpointFlusher   │
+                                          │  ─────────────────   │
+                                          │  1. item.Apply()     │
+                                          │  2. updateCheckpoint│
+                                          │      File()         │
+                                          └─────────────────────┘
 ```
 
-**设计说明**：
+**CheckpointAsyncWriter = AsyncWriter + checkpointFlusher**
 
-- `CheckpointAsyncWriter` 组合 `AsyncWriter` 和 `checkpointFlusher`
-- `checkpointFlusher` 先将所有更新 Apply 到内存，再调用 `updateCheckpointFile()` 写入文件
-- `updateCheckpointFile()` 使用临时文件 + `fsync` + `rename` 提升原子性和持久化保证
+| 组件 | 说明 |
+|------|------|
+| **AsyncWriter** | 通用异步批量写入器，管理 channel、items、ticker、flush 触发逻辑 |
+| **checkpointFlusher** | checkpoint 专用 flusher，将 items 应用到内存 checkpoint，再写入磁盘 |
+| **UploadPartUpdate** | 上传 part 更新项，Apply() 更新 UploadParts[i] 的 Etag 和 IsCompleted |
+| **DownloadPartUpdate** | 下载 part 更新项，Apply() 更新 DownloadParts[i] 的 IsCompleted |
+
+**工作流程**：
+
+```
+part 完成 → Submit(UploadPartUpdate{PartNumber:1, ETag:"xxx"})
+                      │
+                      ▼
+            channel: [Update{1,"etag1"}, Update{2,"etag2"}, ...]
+                      │
+                      ▼
+                run() goroutine
+                      │
+         ┌────────────┼────────────┐
+         │            │            │
+         ▼            ▼            ▼
+     batchSize    ticker      flushReq
+    达到阈值      定时触发    SyncFlush
+         │            │            │
+         └────────────┼────────────┘
+                      │
+                      ▼
+             checkpointFlusher.Flush()
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+          ▼                       ▼
+    item.Apply()          updateCheckpointFile()
+    (内存更新)              (文件写入)
+```
+
+**为什么需要组合**：
+
+| 维度 | AsyncWriter | CheckpointAsyncWriter |
+|------|------------|----------------------|
+| **泛型** | 通用，任何 `AsyncItem + AsyncFlusher` | 专用，只为 checkpoint |
+| **Apply 逻辑** | 不知道业务含义 | 知道：更新 UploadParts[i] |
+| **Flusher** | 外部传入 | 内置 `checkpointFlusher` |
+
+**核心价值**：将"哪些字段需要更新"和"如何更新"封装在一起，对调用方透明。
 
 ### 3.3 updateCheckpointFile 原子性
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                   updateCheckpointFile Flow                      │
+│              updateCheckpointFile 写入链路                       │
 └─────────────────────────────────────────────────────────────────┘
 
-                  xml.Marshal(target)
-                        │
-                        ▼
-              ┌──────────────────┐
-              │ Open(.tmp)       │
-              │ + Write          │
-              └──────────────────┘
-                        │
-                        ▼
-              ┌──────────────────┐
-              │ file.Sync()      │ ──── 内容持久化
-              └──────────────────┘
-                        │
-                        ▼
-              ┌──────────────────┐
-              │   os.Rename()    │ ──── 原子替换
-              └──────────────────┘
-                        │
-                        ▼
-              ┌──────────────────┐
-              │ parent dir Sync  │ ──── 非 Windows best-effort
-              └──────────────────┘
-                        │
-                        ▼
-                  checkpoint.xml
+    xml.Marshal(target)
+           │
+           ▼
+    ┌──────────────────────┐
+    │   checkpoint.xml.tmp  │  ← 临时文件（写入 + Sync）
+    └──────────────────────┘
+           │
+           │ os.Rename()
+           ▼
+    ┌──────────────────────┐
+    │   checkpoint.xml     │  ← 原子替换
+    └──────────────────────┘
+           │
+           │ sync(dir) 非 Windows
+           ▼
+    ┌──────────────────────┐
+    │     父目录 Sync       │  ← best-effort
+    └──────────────────────┘
 ```
+
+**临时文件 + Rename 的安全性**：
+
+| 崩溃时机 | 结果 | 恢复 |
+|---------|------|------|
+| 写 .tmp 时崩溃 | checkpoint.xml 不变 | 使用旧 checkpoint |
+| Sync() 时崩溃 | .tmp 可能未完全持久化 | 使用旧 checkpoint |
+| Rename() 时崩溃 | **原子操作，不存在半完成** | 要么完全成功，要么失败 |
+| 父目录 Sync() 时崩溃 | 目录条目可能未持久化 | 系统下次 mount 时修复 |
+
+**为什么用临时文件而非直接写**：
+
+```
+直接写的风险：
+  WriteFile(checkpoint.xml, data)
+          │
+          ├─ 部分数据已写入 ──→ checkpoint.xml 损坏
+          └─ 进程崩溃 ──→ 重启后解析失败，丢失所有状态
+
+临时文件 + Rename：
+  checkpoint.xml.tmp 写入完整数据
+          │
+          ├─ 崩溃发生在写入期间 ──→ checkpoint.xml 不变
+          ├─ 崩溃发生在 Sync 期间 ──→ checkpoint.xml 不变
+          └─ Rename 成功 ──→ checkpoint.xml 完整
+```
+
+**Checkpoint 文件格式（XML）**：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<UploadFileCheckpoint>
+  <Bucket>my-bucket</Bucket>
+  <Key>large-file.zip</Key>
+  <UploadId>obs-upload-id</UploadId>
+  <FileUrl>/path/to/local/file.zip</FileUrl>
+  <FileInfo>
+    <LastModified>1700000000</LastModified>
+    <Size>104857600</Size>
+  </FileInfo>
+  <UploadParts>
+    <UploadPart>
+      <PartNumber>1</PartNumber>
+      <Etag>"abc123"</Etag>
+      <PartSize>5242880</PartSize>
+      <Offset>0</Offset>
+      <IsCompleted>true</IsCompleted>
+    </UploadPart>
+    ...
+  </UploadParts>
+</UploadFileCheckpoint>
+```
+
+**关键保证**：每个时刻要么有完整的旧 checkpoint，要么有完整的新 checkpoint，**不存在损坏的 checkpoint**。
 
 ---
 
@@ -304,15 +394,37 @@ Timeline:
 
 | 参数名称 | 参数类型 | 是否必选 | 描述 |
 |---------|----------|----------|------|
-| `CheckpointBatchSize` | int | 否 | 异步写入器的批次大小。累积至此数量后触发一次 flush。**取值范围**：>0。**默认取值**：5（待性能测试确定）。**建议值**：10~100 |
-| `CheckpointFlushInterval` | int64 | 否 | 强制 flush 间隔秒数。即使未达到 batchSize，每隔此时间也会触发一次 flush。**取值范围**：>0。**默认取值**：5（待性能测试确定）。**建议值**：3~10 |
-| `CheckpointReconcile` | bool | 否 | 是否在加载时与 OBS ListParts 对账。开启后会在加载 checkpoint 时调用 ListParts 与服务端状态比对，适用于超大文件（10000+ parts）和高可靠性场景。**取值范围**：true/false。**默认取值**：false |
+| `CheckpointBatchSize` | int | 否 | 异步写入器的批次大小。累积至此数量后触发一次 flush。**取值范围**：>0 且 ≤ 分段数。**默认取值**：5。**建议值**：10~20（最优性能） |
+| `CheckpointFlushInterval` | int64 | 否 | 强制 flush 间隔秒数。即使未达到 batchSize，每隔此时间也会触发一次 flush。**取值范围**：>0，建议 ≤ 60s。**默认取值**：5s。**建议值**：3~10s |
 
 ### 4.2 DownloadFileInput 新增字段
 
 | 参数名称 | 参数类型 | 是否必选 | 描述 |
 |---------|----------|----------|------|
-| `CheckpointBatchSize` | int | 否 | 异步写入器的批次大小。累积至此数量后触发一次 flush。**取值范围**：>0。**默认取值**：5（待性能测试确定）。**建议值**：10~100 |
+| `CheckpointBatchSize` | int | 否 | 异步写入器的批次大小。累积至此数量后触发一次 flush。**取值范围**：>0 且 ≤ 分段数。**默认取值**：5。**建议值**：10~20（最优性能） |
+| `CheckpointFlushInterval` | int64 | 否 | 强制 flush 间隔秒数。即使未达到 batchSize，每隔此时间也会触发一次 flush。**取值范围**：>0，建议 ≤ 60s。**默认取值**：5s。**建议值**：3~10s |
+
+**参数约束**：
+
+```
+CheckpointBatchSize：
+  - 合理范围：5 ≤ batchSize ≤ 分段数
+  - batchSize > 分段数：失去批量意义，一次 flush 包含所有分段
+  - batchSize = 1：每提交一个就 flush，高 IO，不推荐
+
+CheckpointFlushInterval：
+  - 合理范围：1s ≤ flushInterval ≤ 文件预计上传时间
+  - flushInterval > 上传预计时间：ticker 永远不会触发，依赖 batchSize
+  - flushInterval < 1s：定时器开销大，不推荐
+```
+
+**配置建议**：
+
+| 场景 | batchSize | flushInterval | 说明 |
+|------|-----------|---------------|------|
+| 高可靠性 | 5 | 3s | 最多丢 5 个 part (25MB@5MB) |
+| 常规使用 | 10-20 | 5s | 平衡性能与可靠性 |
+| 大文件（GB+） | 20-50 | 10s | 减少 checkpoint 写入次数 |
 | `CheckpointFlushInterval` | int64 | 否 | 强制 flush 间隔秒数。即使未达到 batchSize，每隔此时间也会触发一次 flush。**取值范围**：>0。**默认取值**：5（待性能测试确定）。**建议值**：3~10 |
 
 ---
@@ -385,7 +497,7 @@ Timeline:
 
 | 风险 | 影响 | 缓解方案 |
 |------|------|---------|
-| channel 满导致数据丢失 | 丢失 part 完成状态，上传场景可能缺失 ETag，影响 `CompleteMultipartUpload` | 改为有界缓冲 + 背压，不再丢弃更新；默认容量保持 `10000`，并支持 `CheckpointBatchSize` / `CheckpointFlushInterval` 调优 |
+| channel 满导致 worker 背压等待 | worker 阻塞在 Submit()，极端慢磁盘或超小 batch 配置下可能长时间等待 | 有界缓冲 + 背压策略，不丢数据；默认容量 10000，调优 batchSize / flushInterval |
 | `SyncFlush()` 与 `run()` 并发操作 `items` | 可能产生数据竞争或遗漏 channel backlog | 改为 `flushReq` 控制通道，所有 `items` 读写、flush、target 更新均由 `run()` goroutine 串行执行 |
 | `EnableCheckpoint=false` 的兼容性回归 | 未启用 checkpoint 的调用方可能触发 nil pointer panic | 在上传/下载收尾路径增加 `cw != nil` 守卫，保持原有非 checkpoint 路径行为不变 |
 | 进度字节数并发读取 | 多 worker 并发上报进度时，`ConsumedBytes` 可能出现竞争读取 | 使用 `atomic.AddInt64()` 的返回值构造事件，避免对共享计数做非原子读取 |
@@ -434,7 +546,6 @@ Timeline:
 | `IT_DownloadFile_CompleteSuccessfully` | 100MB, partSize=5MB, TaskNum=5 | 最终文件 MD5 正确 | **PASS** |
 | `IT_DownloadFile_ResumeFromCheckpoint` | 下载 50% 后中断，重启继续 | 从断点继续，最终文件正确 | **PASS** |
 | `IT_ConcurrentUpload_NotInterfere` | TaskNum=10 并发上传不同文件 | 各文件独立，无竞争 | **PASS** |
-| `IT_CheckpointReconcile_RecoverFromOBS` | 模拟 OBS 端多 part 状态 | 应从 OBS 恢复状态 | **PASS** |
 | `IT_UploadFile_ProgressBytesMonotonic` | 100MB, partSize=1MB, TaskNum=10, 线程安全 listener | `ConsumedBytes` 单调不减，最终值等于文件大小 | **PASS** |
 | `IT_DownloadFile_ProgressBytesMonotonic` | 100MB, partSize=1MB, TaskNum=10, 线程安全 listener | `ConsumedBytes` 单调不减，最终值等于对象大小 | **PASS** |
 | `IT_ProgressListener_ConcurrentSafe` | TaskNum=10, 使用带锁 listener 收集事件 | SDK 在并发 callback 契约下正常工作，无 panic/死锁 | **PASS** |
@@ -674,26 +785,7 @@ input := UploadFileInput{
 output, err := obsClient.UploadFile(input)
 ```
 
-### 7.3 开启 ListParts 对账（高可靠性场景）
-
-```go
-input := UploadFileInput{
-    Bucket:                    "my-bucket",
-    Key:                      "large-file.zip",
-    UploadFile:               "/path/to/large-file.zip",
-    PartSize:                 5 * 1024 * 1024,
-    TaskNum:                  10,
-    EnableCheckpoint:        true,
-    CheckpointFile:           "/tmp/upload.cpt",
-    CheckpointBatchSize:      20,
-    CheckpointFlushInterval:  10,
-    CheckpointReconcile:      true,  // 开启对账
-}
-
-output, err := obsClient.UploadFile(input)
-```
-
-### 7.4 下载用法
+### 7.3 下载用法
 
 ```go
 input := DownloadFileInput{
@@ -722,7 +814,7 @@ output, err := obsClient.DownloadFile(input)
 | `obs/async_test.go` | **新增** | 单元测试（13 cases，覆盖 backpressure / SyncFlush / 兼容性） |
 | `obs/transfer_test.go` | **新增** | checkpoint durability 单元测试 |
 | `obs/transfer.go` | 大改 | 使用 CheckpointAsyncWriter + SyncFlush |
-| `obs/model_object.go` | 中改 | 新增 CheckpointBatchSize, CheckpointFlushInterval, CheckpointReconcile |
+| `obs/model_object.go` | 中改 | 新增 CheckpointBatchSize, CheckpointFlushInterval |
 | `tests/benchmark/*` | **新增** | 性能测试 |
 | `tests/it/*` | **新增** | 集成测试 |
 

@@ -334,7 +334,6 @@ type UploadFileInput struct {
 	CheckpointFile          string
 	CheckpointBatchSize     int   // batch size for async checkpoint writer, configurable by user
 	CheckpointFlushInterval int64 // flush interval in seconds for async checkpoint writer, configurable by user
-	CheckpointReconcile     bool  // whether to reconcile with OBS ListParts on load (default false)
 	EncodingType            string
 	HttpHeader
 }

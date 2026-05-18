@@ -192,6 +192,219 @@ func TestAsyncWriter_TickerFlush(t *testing.T) {
 	}
 }
 
+// TestAsyncWriter_FlushTriggerORRelationship verifies that batchSize and flushInterval
+// are OR conditions - either one can trigger flush independently
+func TestAsyncWriter_FlushTriggerORRelationship(t *testing.T) {
+	// Scenario 1: batchSize triggers flush even when ticker hasn't fired yet
+	t.Run("batchSize_trigger_before_ticker", func(t *testing.T) {
+		flusher := &testFlusher{}
+		// batchSize=5, flushInterval=10s (long enough that ticker won't fire during test)
+		aw := NewAsyncWriter(nil, flusher,
+			WithAsyncBatchSize(5),
+			WithAsyncFlushInterval(10*time.Second),
+		)
+		defer aw.Shutdown()
+
+		// submit 4 items - not enough for batchSize
+		for i := 1; i <= 4; i++ {
+			aw.Submit(&testItem{id: i})
+		}
+		time.Sleep(50 * time.Millisecond)
+
+		flusher.mu.Lock()
+		if len(flusher.results) != 0 {
+			t.Errorf("expected 0 batches with 4 items < batchSize=5, got %d", len(flusher.results))
+		}
+		flusher.mu.Unlock()
+
+		// submit 5th item - reaches batchSize, should trigger flush immediately
+		aw.Submit(&testItem{id: 5})
+		time.Sleep(50 * time.Millisecond)
+
+		flusher.mu.Lock()
+		defer flusher.mu.Unlock()
+
+		if len(flusher.results) != 1 {
+			t.Errorf("expected 1 batch after reaching batchSize, got %d", len(flusher.results))
+		}
+		if len(flusher.results[0]) != 5 {
+			t.Errorf("expected 5 items in batch, got %d", len(flusher.results[0]))
+		}
+	})
+
+	// Scenario 2: ticker triggers flush even when batchSize isn't reached
+	t.Run("ticker_trigger_without_batchSize", func(t *testing.T) {
+		flusher := &testFlusher{}
+		// batchSize=100 (large), flushInterval=100ms (short)
+		aw := NewAsyncWriter(nil, flusher,
+			WithAsyncBatchSize(100),
+			WithAsyncFlushInterval(100*time.Millisecond),
+		)
+		defer aw.Shutdown()
+
+		// submit only 2 items - far less than batchSize=100
+		aw.Submit(&testItem{id: 1})
+		aw.Submit(&testItem{id: 2})
+		time.Sleep(50 * time.Millisecond) // ensure ticker hasn't fired yet
+
+		flusher.mu.Lock()
+		if len(flusher.results) != 0 {
+			t.Errorf("expected 0 batches before ticker fires, got %d", len(flusher.results))
+		}
+		flusher.mu.Unlock()
+
+		// wait for ticker to fire (>100ms)
+		time.Sleep(200 * time.Millisecond)
+
+		flusher.mu.Lock()
+		defer flusher.mu.Unlock()
+
+		if len(flusher.results) != 1 {
+			t.Errorf("expected 1 batch after ticker fires, got %d", len(flusher.results))
+		}
+		if len(flusher.results[0]) != 2 {
+			t.Errorf("expected 2 items in ticker batch, got %d", len(flusher.results[0]))
+		}
+	})
+}
+
+// TestAsyncWriter_InvalidConfig_UsesDefaults verifies that invalid values (<=0) are ignored and defaults are used
+func TestAsyncWriter_InvalidConfig_UsesDefaults(t *testing.T) {
+	t.Run("batchSize_0_uses_default_5", func(t *testing.T) {
+		flusher := &testFlusher{}
+		aw := NewAsyncWriter(nil, flusher,
+			WithAsyncBatchSize(0), // invalid
+			WithAsyncFlushInterval(10*time.Second),
+		)
+		defer aw.Shutdown()
+
+		// batchSize=0 should be ignored, default batchSize=5 used
+		// submit 4 items (< 5), should NOT trigger flush
+		for i := 1; i <= 4; i++ {
+			aw.Submit(&testItem{id: i})
+		}
+		time.Sleep(50 * time.Millisecond)
+
+		flusher.mu.Lock()
+		if len(flusher.results) != 0 {
+			t.Errorf("batchSize=0 should use default 5, expected 0 flush with 4 items, got %d", len(flusher.results))
+		}
+		flusher.mu.Unlock()
+
+		// submit 5th item, should trigger flush (batchSize=5)
+		aw.Submit(&testItem{id: 5})
+		time.Sleep(50 * time.Millisecond)
+
+		flusher.mu.Lock()
+		defer flusher.mu.Unlock()
+		if len(flusher.results) != 1 {
+			t.Errorf("expected 1 flush after 5th item (batchSize=5 default), got %d", len(flusher.results))
+		}
+	})
+
+	t.Run("batchSize_negative_uses_default", func(t *testing.T) {
+		flusher := &testFlusher{}
+		aw := NewAsyncWriter(nil, flusher,
+			WithAsyncBatchSize(-10), // invalid negative
+		)
+		defer aw.Shutdown()
+
+		for i := 1; i <= 4; i++ {
+			aw.Submit(&testItem{id: i})
+		}
+		time.Sleep(50 * time.Millisecond)
+
+		flusher.mu.Lock()
+		if len(flusher.results) != 0 {
+			t.Errorf("batchSize=-10 should use default 5, expected 0 flush with 4 items, got %d", len(flusher.results))
+		}
+		flusher.mu.Unlock()
+	})
+
+	t.Run("flushInterval_0_uses_default", func(t *testing.T) {
+		flusher := &testFlusher{}
+		aw := NewAsyncWriter(nil, flusher,
+			WithAsyncBatchSize(100),
+			WithAsyncFlushInterval(0), // invalid
+		)
+		defer aw.Shutdown()
+
+		// flushInterval=0 should be ignored, default 5s used
+		aw.Submit(&testItem{id: 1})
+		aw.Submit(&testItem{id: 2})
+		time.Sleep(100 * time.Millisecond) // less than 5s
+
+		flusher.mu.Lock()
+		if len(flusher.results) != 0 {
+			t.Errorf("flushInterval=0 should use default 5s, expected 0 flush in 100ms, got %d", len(flusher.results))
+		}
+		flusher.mu.Unlock()
+	})
+}
+
+// TestAsyncWriter_BatchSize_BoundaryValues tests boundary values for batchSize
+func TestAsyncWriter_BatchSize_BoundaryValues(t *testing.T) {
+	t.Run("batchSize_1_flushes_immediately", func(t *testing.T) {
+		flusher := &testFlusher{}
+		aw := NewAsyncWriter(nil, flusher, WithAsyncBatchSize(1))
+		defer aw.Shutdown()
+
+		aw.Submit(&testItem{id: 1})
+		time.Sleep(50 * time.Millisecond)
+
+		flusher.mu.Lock()
+		defer flusher.mu.Unlock()
+		if len(flusher.results) != 1 {
+			t.Errorf("batchSize=1 should flush immediately after each Submit, got %d flushes", len(flusher.results))
+		}
+	})
+
+	t.Run("batchSize_larger_than_parts_uses_ticker", func(t *testing.T) {
+		flusher := &testFlusher{}
+		// batchSize=100 but only 5 parts submitted
+		aw := NewAsyncWriter(nil, flusher,
+			WithAsyncBatchSize(100),
+			WithAsyncFlushInterval(50*time.Millisecond),
+		)
+		defer aw.Shutdown()
+
+		for i := 1; i <= 5; i++ {
+			aw.Submit(&testItem{id: i})
+		}
+		time.Sleep(100 * time.Millisecond) // wait for ticker
+
+		flusher.mu.Lock()
+		defer flusher.mu.Unlock()
+		if len(flusher.results) < 1 {
+			t.Errorf("ticker should trigger flush when batchSize > items count, got %d flushes", len(flusher.results))
+		}
+		if len(flusher.results[0]) != 5 {
+			t.Errorf("expected 5 items in ticker-triggered flush, got %d", len(flusher.results[0]))
+		}
+	})
+}
+
+// TestAsyncWriter_FlushInterval_BoundaryValues tests boundary values for flushInterval
+func TestAsyncWriter_FlushInterval_BoundaryValues(t *testing.T) {
+	t.Run("flushInterval_100ms_is_valid", func(t *testing.T) {
+		flusher := &testFlusher{}
+		aw := NewAsyncWriter(nil, flusher,
+			WithAsyncBatchSize(100),
+			WithAsyncFlushInterval(100*time.Millisecond),
+		)
+		defer aw.Shutdown()
+
+		aw.Submit(&testItem{id: 1})
+		time.Sleep(200 * time.Millisecond)
+
+		flusher.mu.Lock()
+		defer flusher.mu.Unlock()
+		if len(flusher.results) < 1 {
+			t.Errorf("flushInterval=100ms should trigger flush within 200ms, got %d flushes", len(flusher.results))
+		}
+	})
+}
+
 func TestAsyncWriter_ConcurrentSubmit(t *testing.T) {
 	flusher := &testFlusher{}
 	// large channel capacity to avoid drops during concurrent submit
